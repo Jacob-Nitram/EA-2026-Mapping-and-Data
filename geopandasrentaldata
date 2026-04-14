@@ -1,0 +1,171 @@
+"""
+SF Rental Data – Geospatial Enrichment Pipeline (Local CSVs)
+=============================================================
+
+Assigns geographic zones to each rental listing via spatial join:
+  1. ZIP Codes       (column: zip_code)
+  2. Zoning Districts (column: districtname)
+  3. Census 2010     (column: TRACTCE10)
+  4. Census 2020     (column: TRACTCE)
+
+Requirements:
+    pip install pandas geopandas shapely
+"""
+
+import pandas as pd
+import geopandas as gpd
+from shapely import wkt
+import warnings
+warnings.filterwarnings("ignore")
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 1. CONFIGURATION
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+BASE = "/Users/carlos_crespo/anaconda_projects/BER project/"
+
+RENTAL_CSV   = BASE + "sf_rentals_consolidated.csv"
+ZIP_CSV      = BASE + "San_Francisco_ZIP_Codes_20260313.csv"
+ZONING_CSV   = BASE + "Zoning_Map_-_Zoning_Districts_20260304.csv"
+CENSUS10_CSV = BASE + "Census_2010_Tracts_20260304.csv"
+CENSUS20_CSV = BASE + "Census_2020__Tracts_for_San_Francisco_20260304.csv"
+
+OUTPUT_CSV   = BASE + "sf_rentals_geo_enriched.csv"
+
+# Boundary config: (csv_path, geometry_column, key_column, output_column_name)
+BOUNDARIES = [
+    (ZIP_CSV,      "geometry",  "zip_code",     "geo_zip"),
+    (ZONING_CSV,   "the_geom",  "districtname", "geo_zoning"),
+    (CENSUS10_CSV, "the_geom",  "TRACTCE10",    "geo_tract_2010"),
+    (CENSUS20_CSV, "the_geom",  "TRACTCE",      "geo_tract_2020"),
+]
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 2. LOAD RENTAL DATA → GeoDataFrame
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+print("=" * 60)
+print("STEP 1: Loading rental data")
+print("=" * 60)
+
+rentals = pd.read_csv(RENTAL_CSV, low_memory=False)
+print(f"  Raw rows: {len(rentals):,}")
+
+rentals = rentals.dropna(subset=["LATITUDE", "LONGITUDE"]).copy()
+rentals["LATITUDE"] = pd.to_numeric(rentals["LATITUDE"], errors="coerce")
+rentals["LONGITUDE"] = pd.to_numeric(rentals["LONGITUDE"], errors="coerce")
+rentals = rentals.dropna(subset=["LATITUDE", "LONGITUDE"])
+
+# Filter to SF bounding box
+rentals = rentals[
+    (rentals["LATITUDE"].between(37.70, 37.85)) &
+    (rentals["LONGITUDE"].between(-122.52, -122.35))
+].copy()
+print(f"  Valid SF coordinates: {len(rentals):,}")
+
+rentals_gdf = gpd.GeoDataFrame(
+    rentals,
+    geometry=gpd.points_from_xy(rentals["LONGITUDE"], rentals["LATITUDE"]),
+    crs="EPSG:4326",
+)
+print(f"  ✓ GeoDataFrame created\n")
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 3. LOAD BOUNDARIES & SPATIAL JOIN
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+print("=" * 60)
+print("STEP 2: Loading boundaries & spatial joins")
+print("=" * 60)
+
+for csv_path, geom_col, key_col, out_col in BOUNDARIES:
+    label = out_col.replace("geo_", "").upper()
+    print(f"\n  ── {label} ──")
+
+    # Load CSV
+    try:
+        df = pd.read_csv(csv_path, low_memory=False)
+    except FileNotFoundError:
+        print(f"    ⚠ File not found: {csv_path}")
+        continue
+
+    print(f"    Loaded {len(df):,} rows")
+
+    # Parse WKT geometry
+    df = df[df[geom_col].notna()].copy()
+    df["geometry"] = df[geom_col].apply(wkt.loads)
+    boundary_gdf = gpd.GeoDataFrame(df, geometry="geometry", crs="EPSG:4326")
+    print(f"    {len(boundary_gdf)} polygons")
+
+    # Spatial join
+    boundary_slim = boundary_gdf[[key_col, "geometry"]].copy()
+    rentals_gdf = gpd.sjoin(
+        rentals_gdf,
+        boundary_slim,
+        how="left",
+        predicate="within",
+    )
+    rentals_gdf = rentals_gdf.rename(columns={key_col: out_col})
+
+    if "index_right" in rentals_gdf.columns:
+        rentals_gdf = rentals_gdf.drop(columns=["index_right"])
+    rentals_gdf = rentals_gdf[~rentals_gdf.index.duplicated(keep="first")]
+
+    matched = rentals_gdf[out_col].notna().sum()
+    total = len(rentals_gdf)
+    print(f"    ✓ Matched {matched:,} / {total:,} ({100*matched/total:.1f}%)")
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 4. VALIDATION
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+print("\n" + "=" * 60)
+print("STEP 3: Validation (original ZIP vs geo-assigned)")
+print("=" * 60)
+
+if "geo_zip" in rentals_gdf.columns:
+    orig = rentals_gdf["ZIP"].astype(str).str[:5]
+    geo  = rentals_gdf["geo_zip"].astype(str).str[:5]
+    both = orig.str.match(r"^\d{5}$") & geo.str.match(r"^\d{5}$")
+    if both.sum() > 0:
+        match = (orig[both] == geo[both]).sum()
+        total = both.sum()
+        print(f"\n  Compared: {total:,}")
+        print(f"  Match:    {match:,} ({100*match/total:.1f}%)")
+        print(f"  Mismatch: {total-match:,} ({100*(total-match)/total:.1f}%)")
+
+        mis = rentals_gdf[both & (orig != geo)]
+        if len(mis) > 0:
+            print(f"\n  Sample mismatches:")
+            print(mis[["ADDRESS", "ZIP", "geo_zip", "LATITUDE", "LONGITUDE"]].head(5).to_string(index=False))
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 5. SAVE
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+print("\n" + "=" * 60)
+print("STEP 4: Saving enriched data")
+print("=" * 60)
+
+out_df = pd.DataFrame(rentals_gdf.drop(columns=["geometry"]))
+out_df.to_csv(OUTPUT_CSV, index=False)
+
+geo_cols = [c for c in ["geo_zip", "geo_zoning", "geo_tract_2010", "geo_tract_2020"]
+            if c in out_df.columns]
+
+print(f"\n  ✓ Saved {len(out_df):,} rows → {OUTPUT_CSV}")
+print(f"\n  New columns:")
+for col in geo_cols:
+    print(f"    {col}: {out_df[col].nunique()} unique, {out_df[col].isna().sum():,} nulls")
+
+if geo_cols:
+    show = ["ADDRESS", "ZIP", "NEIGHBORHOOD"] + geo_cols
+    show = [c for c in show if c in out_df.columns]
+    print(f"\n  Sample:")
+    print(out_df[show].head(5).to_string(index=False))
+
+print("\n✓ Done!")
